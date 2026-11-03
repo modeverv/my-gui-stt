@@ -1,0 +1,12 @@
+[project]
+name = "stt-refine"
+version = "0.1.0"
+description = "Local refinement pipeline for LocalSpeechSTT (Whisper cross-check, neural speaker embeddings, Gemma correction)"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "mlx-whisper>=0.4",
+    "mlx-lm>=0.28",
+    "sherpa-onnx>=1.12",
+    "numpy",
+    "soundfile",
+]

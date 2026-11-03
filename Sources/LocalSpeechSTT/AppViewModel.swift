@@ -7,6 +7,7 @@ import Combine
 enum TranscriptViewMode: String, CaseIterable, Identifiable {
     case timeline = "タイムライン編集"
     case fullText = "全文プレビュー"
+    case review = "補正レビュー"
 
     var id: String { rawValue }
 }
@@ -80,6 +81,14 @@ final class AppViewModel: ObservableObject {
     /// Frame-level acoustic features of the current file, kept for instant re-clustering
     private var diarizationFeatures: DiarizationFeatures?
     private var cancellables: Set<AnyCancellable> = []
+
+    // MARK: - High-Accuracy Refinement & Human Review State
+    @Published var isRefining: Bool = false
+    @Published var suggestions: [CorrectionSuggestion] = []
+    @Published var glossary: Glossary = Glossary.load()
+    private var refineTask: Task<Void, Never>?
+    /// Segments as they were before a suggestion was applied, so that it can be undone
+    private var undoSnapshots: [UUID: [TranscriptSegment]] = [:]
 
     init() {
         playerManager.$currentTime
@@ -290,6 +299,9 @@ final class AppViewModel: ObservableObject {
         speakerNames = [:]
         selectedSpeakerFilter = nil
         searchQuery = ""
+        cancelRefinement()
+        suggestions = []
+        undoSnapshots = [:]
         diarizationFeatures = nil
         progressFraction = 0
         processedSeconds = 0
@@ -351,6 +363,10 @@ final class AppViewModel: ObservableObject {
     func startTranscription() {
         guard let info = mediaInfo else { return }
         cancelTranscription()
+        cancelRefinement()
+        suggestions = []
+        undoSnapshots = [:]
+        if viewMode == .review { viewMode = .timeline }
         reclusterTask?.cancel()
         reclusterTask = nil
         isReclustering = false
@@ -374,6 +390,8 @@ final class AppViewModel: ObservableObject {
             .components(separatedBy: CharacterSet(charactersIn: ",、\n\t "))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+            // Approved glossary terms help the recognizer spell them correctly in the first place
+            + glossary.approved.map(\.to).filter { !$0.isEmpty }
 
         let config = TranscriptionConfig(
             engine: selectedEngine,
@@ -416,7 +434,8 @@ final class AppViewModel: ObservableObject {
                 guard !Task.isCancelled, runID == self.transcriptionRunID else { return }
                 let elapsed = Date().timeIntervalSince(startTime)
                 self.diarizationFeatures = finalResult.diarizationFeatures
-                self.segments = finalResult.segments
+                let (glossed, glossaryHits) = self.applyApprovedGlossary(to: finalResult.segments)
+                self.segments = glossed
                 self.isTranscribing = false
                 self.progressFraction = 1.0
                 self.volatilePreviewText = ""
@@ -429,7 +448,7 @@ final class AppViewModel: ObservableObject {
                     finalResult.segments.count,
                     elapsed,
                     self.processingSpeedMultiplier
-                )
+                ) + (glossaryHits > 0 ? " • 用語辞書を \(glossaryHits) 箇所に適用" : "")
                 self.updateActivePlayingSegment()
                 // The speaker mode may have been changed while the run was in progress
                 if self.speakerMode != config.speakerMode {
@@ -460,6 +479,246 @@ final class AppViewModel: ObservableObject {
             volatilePreviewText = ""
             statusMessage = "文字起こしを停止しました (\(segments.count) セグメント保持)"
         }
+    }
+
+    // MARK: - High-Accuracy Refinement (Whisper + neural speakers + local LLM)
+
+    var canRefine: Bool {
+        mediaInfo != nil && !segments.isEmpty && !isTranscribing && !isRefining && !isReclustering
+    }
+
+    var pendingSuggestionCount: Int {
+        suggestions.filter { $0.status == .pending }.count
+    }
+
+    func startRefinement() {
+        guard canRefine, let media = mediaInfo?.url else { return }
+        let input = segments
+        let mode = speakerMode
+        let glossarySnapshot = glossary
+        let runID = transcriptionRunID
+        let startedAt = Date()
+        isRefining = true
+        errorMessage = nil
+        progressFraction = 0
+        statusMessage = "高精度補正を準備しています..."
+
+        let onProgress: @Sendable (Double, String) -> Void = { [weak self] fraction, message in
+            Task { @MainActor [weak self] in
+                guard let self, self.isRefining else { return }
+                self.progressFraction = fraction
+                self.statusMessage = "高精度補正: " + message
+            }
+        }
+        refineTask = Task { [weak self] in
+            do {
+                let review = try await RefinementService.run(
+                    media: media,
+                    segments: input,
+                    speakerMode: mode,
+                    glossary: glossarySnapshot,
+                    onProgress: onProgress
+                )
+                guard let self, !Task.isCancelled, runID == self.transcriptionRunID else { return }
+                self.isRefining = false
+                self.progressFraction = 1
+                self.segments = review.segments
+                self.suggestions = review.suggestions.sorted(by: Self.reviewOrder)
+                self.undoSnapshots = [:]
+                self.viewMode = .review
+                let minutes = Date().timeIntervalSince(startedAt) / 60
+                self.statusMessage = String(
+                    format: "高精度補正完了 • 確認待ち %d 件 • 辞書を %d 箇所に適用 • %.1f 分",
+                    self.pendingSuggestionCount, review.autoAppliedTerms.count, minutes
+                )
+            } catch {
+                guard let self, runID == self.transcriptionRunID else { return }
+                self.isRefining = false
+                if error is CancellationError || Task.isCancelled {
+                    self.statusMessage = "高精度補正を中止しました"
+                } else {
+                    self.errorMessage = error.localizedDescription
+                    self.statusMessage = "高精度補正に失敗しました"
+                }
+            }
+        }
+    }
+
+    func cancelRefinement() {
+        refineTask?.cancel()
+        refineTask = nil
+        if isRefining {
+            isRefining = false
+            statusMessage = "高精度補正を中止しました"
+        }
+    }
+
+    /// Terms first (one decision fixes many places), then speakers, then LLM-recommended spans.
+    static func reviewOrder(_ a: CorrectionSuggestion, _ b: CorrectionSuggestion) -> Bool {
+        func rank(_ s: CorrectionSuggestion) -> Int {
+            switch s.kind {
+            case .term: return 0
+            case .speaker: return 1
+            case .span: return s.recommended == true ? 2 : 3
+            }
+        }
+        return rank(a) < rank(b)
+    }
+
+    func segment(withID id: UUID?) -> TranscriptSegment? {
+        guard let id else { return nil }
+        return segments.first { $0.id == id }
+    }
+
+    // MARK: - Human Review Actions
+
+    /// Accepts a suggestion. `customText` replaces the candidate with what the reviewer typed.
+    func acceptSuggestion(_ suggestionID: UUID, customText: String? = nil) {
+        guard let si = suggestions.firstIndex(where: { $0.id == suggestionID }) else { return }
+        let sug = suggestions[si]
+        let custom = customText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let useCustom = !(custom ?? "").isEmpty
+
+        switch sug.kind {
+        case .term:
+            guard let from = sug.original, let to = useCustom ? custom : sug.candidate else { return }
+            undoSnapshots[sug.id] = replaceEverywhere(from, with: to)
+            // Risky (short) terms fix this transcript only and are not remembered for future files
+            if TermReplacer.glossaryRisk(for: from) == nil {
+                glossary.approve(from: from, to: to)
+                glossary.save()
+            }
+        case .span:
+            guard let segID = sug.segmentID, let idx = segments.firstIndex(where: { $0.id == segID }),
+                  let original = sug.original, let replacement = useCustom ? custom : sug.candidate else { return }
+            guard let newText = Self.replacing(original, at: sug.offset, with: replacement, in: segments[idx].text) else {
+                errorMessage = "この箇所は既に編集されているため適用できませんでした: 「\(original)」"
+                return
+            }
+            undoSnapshots[sug.id] = [segments[idx]]
+            segments[idx].text = newText
+            segments[idx].tokens = nil
+        case .speaker:
+            guard let segID = sug.segmentID, let idx = segments.firstIndex(where: { $0.id == segID }),
+                  let alt = sug.alternative else { return }
+            undoSnapshots[sug.id] = [segments[idx]]
+            segments[idx].speakerID = alt
+        }
+        suggestions[si].status = useCustom ? .edited : .accepted
+        suggestions[si].resolvedText = useCustom ? custom : nil
+    }
+
+    func rejectSuggestion(_ suggestionID: UUID) {
+        guard let si = suggestions.firstIndex(where: { $0.id == suggestionID }) else { return }
+        let sug = suggestions[si]
+        if sug.kind == .term, let from = sug.original, let to = sug.candidate {
+            glossary.reject(from: from, to: to)
+            glossary.save()
+        }
+        suggestions[si].status = .rejected
+    }
+
+    func undoSuggestion(_ suggestionID: UUID) {
+        guard let si = suggestions.firstIndex(where: { $0.id == suggestionID }) else { return }
+        let sug = suggestions[si]
+        for old in undoSnapshots[sug.id] ?? [] {
+            if let idx = segments.firstIndex(where: { $0.id == old.id }) {
+                segments[idx] = old
+            }
+        }
+        undoSnapshots[sug.id] = nil
+        if sug.kind == .term, let from = sug.original {
+            let to = sug.resolvedText ?? sug.candidate ?? ""
+            glossary.approved.removeAll { $0.from == from && $0.to == to }
+            glossary.rejected.removeAll { $0.from == from && $0.to == (sug.candidate ?? "") }
+            glossary.save()
+        }
+        suggestions[si].status = .pending
+        suggestions[si].resolvedText = nil
+    }
+
+    /// "This is wrong, it should be ..." — the reviewer's own correction, applied to the whole transcript
+    /// and remembered in the glossary for future files.
+    @discardableResult
+    func applyManualCorrection(from: String, to: String) -> (count: Int, savedToGlossary: Bool) {
+        let from = from.trimmingCharacters(in: .whitespacesAndNewlines)
+        let to = to.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !from.isEmpty, from != to else { return (0, false) }
+        let count = occurrenceCount(of: from)
+        guard count > 0 else { return (0, false) }
+        let risky = TermReplacer.glossaryRisk(for: from) != nil
+        let sug = CorrectionSuggestion(
+            id: UUID(), kind: .term, status: .edited,
+            segmentIDs: segments.filter { TermReplacer.occurrences(of: from, in: $0.text) > 0 }.map(\.id),
+            original: from, candidate: to, recommended: nil,
+            note: risky ? "手動で指摘 (この書き起こしのみ・辞書には未登録)" : "手動で指摘", resolvedText: to
+        )
+        undoSnapshots[sug.id] = replaceEverywhere(from, with: to)
+        suggestions.insert(sug, at: 0)
+        if !risky {
+            glossary.approve(from: from, to: to)
+            glossary.save()
+        }
+        return (count, !risky)
+    }
+
+    func occurrenceCount(of term: String) -> Int {
+        let t = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return 0 }
+        return segments.reduce(0) { $0 + TermReplacer.occurrences(of: t, in: $1.text) }
+    }
+
+    func removeGlossaryEntry(_ entry: GlossaryEntry) {
+        glossary.approved.removeAll { $0 == entry }
+        glossary.rejected.removeAll { $0 == entry }
+        glossary.save()
+    }
+
+    /// Applies `from -> to` to every utterance and returns the previous versions of the changed ones.
+    private func replaceEverywhere(_ from: String, with to: String) -> [TranscriptSegment] {
+        var previous: [TranscriptSegment] = []
+        for i in segments.indices {
+            let newText = TermReplacer.replace(from, with: to, in: segments[i].text)
+            if newText != segments[i].text {
+                previous.append(segments[i])
+                segments[i].text = newText
+                segments[i].tokens = nil
+            }
+        }
+        return previous
+    }
+
+    private func applyApprovedGlossary(to input: [TranscriptSegment]) -> ([TranscriptSegment], Int) {
+        guard !glossary.approved.isEmpty else { return (input, 0) }
+        var output = input
+        var hits = 0
+        for i in output.indices {
+            let result = TermReplacer.apply(glossary.approved, to: output[i].text)
+            if result.hits > 0 {
+                hits += result.hits
+                output[i].text = result.text
+                output[i].tokens = nil
+            }
+        }
+        return (output, hits)
+    }
+
+    /// Replaces `original` at the given Unicode-scalar offset, or at its first occurrence if the text moved.
+    static func replacing(_ original: String, at offset: Int?, with replacement: String, in text: String) -> String? {
+        let scalars = text.unicodeScalars
+        if let offset, offset >= 0, offset + original.unicodeScalars.count <= scalars.count {
+            let start = scalars.index(scalars.startIndex, offsetBy: offset)
+            let end = scalars.index(start, offsetBy: original.unicodeScalars.count)
+            if String(scalars[start..<end]) == original {
+                var out = String.UnicodeScalarView()
+                out.append(contentsOf: scalars[..<start])
+                out.append(contentsOf: replacement.unicodeScalars)
+                out.append(contentsOf: scalars[end...])
+                return String(out)
+            }
+        }
+        guard let range = text.range(of: original) else { return nil }
+        return text.replacingCharacters(in: range, with: replacement)
     }
 
     // MARK: - Copy & Export Actions

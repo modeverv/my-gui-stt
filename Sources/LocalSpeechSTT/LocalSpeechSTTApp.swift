@@ -66,12 +66,18 @@ struct LocalSpeechSTTApp: App {
             )
         }
 
+        // Support "--refine <segments.json> <media>" to run the app's high-accuracy refinement headlessly
+        if let idx = args.firstIndex(of: "--refine"), idx + 2 < args.count {
+            CLIVerificationRunner.refineAndExit(segmentsJSONPath: args[idx + 1], mediaPath: args[idx + 2], speakerMode: speakerMode)
+        }
+
         // Support "--diarize <segments.json> <media>" to re-run speaker diarization on a saved transcript
         if let idx = args.firstIndex(of: "--diarize"), idx + 2 < args.count {
             CLIVerificationRunner.rediarizeAndExit(
                 segmentsJSONPath: args[idx + 1],
                 mediaPath: args[idx + 2],
-                speakerMode: speakerMode
+                speakerMode: speakerMode,
+                jsonOutPath: optionValue("--json-out")
             )
         }
     }
@@ -135,7 +141,7 @@ struct LocalSpeechSTTApp: App {
 // MARK: - CLI Verification / Headless Test Runner
 
 enum CLIVerificationRunner {
-    static func rediarizeAndExit(segmentsJSONPath: String, mediaPath: String, speakerMode: SpeakerCountMode) -> Never {
+    static func rediarizeAndExit(segmentsJSONPath: String, mediaPath: String, speakerMode: SpeakerCountMode, jsonOutPath: String?) -> Never {
         Task {
             do {
                 let data = try Data(contentsOf: URL(fileURLWithPath: segmentsJSONPath))
@@ -146,6 +152,11 @@ enum CLIVerificationRunner {
                 let t1 = Date()
                 let result = DiarizationEngine.diarize(segments: segments, features: features, mode: speakerMode)
                 let t2 = Date()
+                if let jsonOutPath {
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted]
+                    try encoder.encode(result).write(to: URL(fileURLWithPath: jsonOutPath))
+                }
                 printSegments(result)
                 print(String(format: "\n=== %d -> %d segments, features %.2fs, diarization %.2fs ===",
                              segments.count, result.count, t1.timeIntervalSince(t0), t2.timeIntervalSince(t1)))
@@ -153,6 +164,35 @@ enum CLIVerificationRunner {
                 exit(0)
             } catch {
                 fputs("Diarization Error: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        RunLoop.main.run()
+        fatalError("Unreachable")
+    }
+
+    static func refineAndExit(segmentsJSONPath: String, mediaPath: String, speakerMode: SpeakerCountMode) -> Never {
+        Task {
+            do {
+                let segments = try JSONDecoder().decode([TranscriptSegment].self, from: Data(contentsOf: URL(fileURLWithPath: segmentsJSONPath)))
+                let t0 = Date()
+                let review = try await RefinementService.run(
+                    media: URL(fileURLWithPath: mediaPath),
+                    segments: segments,
+                    speakerMode: speakerMode,
+                    glossary: Glossary.load()
+                ) { fraction, message in
+                    print(String(format: "  [%3.0f%%] %@", fraction * 100, message))
+                }
+                var kinds: [SuggestionKind: Int] = [:]
+                for s in review.suggestions { kinds[s.kind, default: 0] += 1 }
+                print(String(format: "=== %d segments, suggestions: term %d / speaker %d / span %d (recommended %d), auto-applied %d, %.1fs ===",
+                             review.segments.count, kinds[.term] ?? 0, kinds[.speaker] ?? 0, kinds[.span] ?? 0,
+                             review.suggestions.filter { $0.kind == .span && $0.recommended == true }.count,
+                             review.autoAppliedTerms.count, Date().timeIntervalSince(t0)))
+                exit(0)
+            } catch {
+                fputs("Refine Error: \(error.localizedDescription)\n", stderr)
                 exit(1)
             }
         }
