@@ -71,7 +71,8 @@ struct LocalSpeechSTTApp: App {
             CLIVerificationRunner.rediarizeAndExit(
                 segmentsJSONPath: args[idx + 1],
                 mediaPath: args[idx + 2],
-                speakerMode: speakerMode
+                speakerMode: speakerMode,
+                jsonOutPath: optionValue("--json-out")
             )
         }
     }
@@ -135,7 +136,7 @@ struct LocalSpeechSTTApp: App {
 // MARK: - CLI Verification / Headless Test Runner
 
 enum CLIVerificationRunner {
-    static func rediarizeAndExit(segmentsJSONPath: String, mediaPath: String, speakerMode: SpeakerCountMode) -> Never {
+    static func rediarizeAndExit(segmentsJSONPath: String, mediaPath: String, speakerMode: SpeakerCountMode, jsonOutPath: String?) -> Never {
         Task {
             do {
                 let data = try Data(contentsOf: URL(fileURLWithPath: segmentsJSONPath))
@@ -146,6 +147,11 @@ enum CLIVerificationRunner {
                 let t1 = Date()
                 let result = DiarizationEngine.diarize(segments: segments, features: features, mode: speakerMode)
                 let t2 = Date()
+                if let jsonOutPath {
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted]
+                    try encoder.encode(result).write(to: URL(fileURLWithPath: jsonOutPath))
+                }
                 printSegments(result)
                 print(String(format: "\n=== %d -> %d segments, features %.2fs, diarization %.2fs ===",
                              segments.count, result.count, t1.timeIntervalSince(t0), t2.timeIntervalSince(t1)))
