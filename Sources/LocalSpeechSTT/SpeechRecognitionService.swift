@@ -46,6 +46,12 @@ struct TranscriptionProgressUpdate: Sendable {
     }
 }
 
+struct TranscriptionResult: Sendable {
+    var segments: [TranscriptSegment]
+    /// Frame-level features kept for instant speaker re-clustering (nil if extraction failed)
+    var diarizationFeatures: DiarizationFeatures?
+}
+
 enum SpeechRecognitionService {
 
     // MARK: - Locale Discovery
@@ -122,7 +128,7 @@ enum SpeechRecognitionService {
         url: URL,
         config: TranscriptionConfig,
         onProgress: @escaping @Sendable (TranscriptionProgressUpdate) -> Void
-    ) async throws -> [TranscriptSegment] {
+    ) async throws -> TranscriptionResult {
         onProgress(TranscriptionProgressUpdate(
             processedSeconds: 0,
             totalSeconds: 1,
@@ -134,29 +140,65 @@ enum SpeechRecognitionService {
         let reader = try await MediaInspector.prepareAudioReader(for: url)
         let totalDuration = max(0.1, reader.durationSeconds)
 
-        switch config.engine {
-        case .speechTranscriber:
-            return try await transcribeWithSpeechTranscriber(
-                reader: reader,
-                totalDuration: totalDuration,
-                config: config,
-                onProgress: onProgress
-            )
-        case .dictationTranscriber:
-            return try await transcribeWithDictationTranscriber(
-                reader: reader,
-                totalDuration: totalDuration,
-                config: config,
-                onProgress: onProgress
-            )
-        case .sfSpeechRecognizer:
-            return try await transcribeWithSFSpeechRecognizer(
-                reader: reader,
-                totalDuration: totalDuration,
-                config: config,
-                onProgress: onProgress
-            )
+        // Frame-level speaker features are extracted in parallel with speech recognition
+        let audioURL = reader.audioFileURL
+        let featureTask = Task.detached(priority: .utility) { () -> DiarizationFeatures? in
+            try? DiarizationEngine.extractFeatures(url: audioURL, shouldCancel: { Task.isCancelled })
         }
+
+        let segments: [TranscriptSegment]
+        do {
+            switch config.engine {
+            case .speechTranscriber:
+                segments = try await transcribeWithSpeechTranscriber(
+                    reader: reader,
+                    totalDuration: totalDuration,
+                    config: config,
+                    onProgress: onProgress
+                )
+            case .dictationTranscriber:
+                segments = try await transcribeWithDictationTranscriber(
+                    reader: reader,
+                    totalDuration: totalDuration,
+                    config: config,
+                    onProgress: onProgress
+                )
+            case .sfSpeechRecognizer:
+                segments = try await transcribeWithSFSpeechRecognizer(
+                    reader: reader,
+                    totalDuration: totalDuration,
+                    config: config,
+                    onProgress: onProgress
+                )
+            }
+        } catch {
+            featureTask.cancel()
+            throw error
+        }
+
+        try Task.checkCancellation()
+        onProgress(TranscriptionProgressUpdate(
+            processedSeconds: totalDuration,
+            totalSeconds: totalDuration,
+            volatilePreviewText: "",
+            statusMessage: "話者分離を実行しています (フレーム単位の音響モデル)...",
+            finalizedSegments: nil
+        ))
+
+        let features = await withTaskCancellationHandler {
+            await featureTask.value
+        } onCancel: {
+            featureTask.cancel()
+        }
+        try Task.checkCancellation()
+        // Keep the reader (and its temporary audio file) alive until feature extraction has finished
+        withExtendedLifetime(reader) {}
+
+        guard let features, config.speakerMode != .off else {
+            return TranscriptionResult(segments: segments, diarizationFeatures: features)
+        }
+        let diarized = DiarizationEngine.diarize(segments: segments, features: features, mode: config.speakerMode)
+        return TranscriptionResult(segments: diarized, diarizationFeatures: features)
     }
 
     // MARK: - Engine 1: Apple SpeechTranscriber (SpeechAnalyzer)
@@ -789,7 +831,8 @@ final class UtteranceSegmentBuilder {
             text: combinedText,
             speakerID: 1,
             confidence: avgConf,
-            embedding: nil
+            embedding: nil,
+            tokens: tokens
         )
     }
 }
