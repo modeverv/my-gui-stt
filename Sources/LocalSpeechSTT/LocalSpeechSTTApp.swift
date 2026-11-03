@@ -3,7 +3,18 @@ import AppKit
 import AVFoundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var onOpenURLs: (([URL]) -> Void)?
+    /// Files opened via Finder / `open -a` can arrive before the window (and this handler) exists;
+    /// they are buffered and delivered as soon as the handler is installed.
+    var onOpenURLs: (([URL]) -> Void)? {
+        didSet {
+            if let handler = onOpenURLs, !pendingURLs.isEmpty {
+                let urls = pendingURLs
+                pendingURLs = []
+                handler(urls)
+            }
+        }
+    }
+    private var pendingURLs: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -11,7 +22,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        onOpenURLs?(urls)
+        if let handler = onOpenURLs {
+            handler(urls)
+        } else {
+            pendingURLs.append(contentsOf: urls)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -34,19 +49,36 @@ struct LocalSpeechSTTApp: App {
             ScreenshotCaptureRunner.runAndExit(outputPath: outPath, mediaPath: mediaPath)
         }
 
-        // Support "--cli <filepath> [--max-seconds <N>]" for automated verification & batch processing
-        if let cliIdx = args.firstIndex(of: "--cli"), cliIdx + 1 < args.count {
-            let filePath = args[cliIdx + 1]
-            var maxSeconds: Double? = nil
-            if let maxIdx = args.firstIndex(of: "--max-seconds"), maxIdx + 1 < args.count {
-                maxSeconds = Double(args[maxIdx + 1])
-            }
-            CLIVerificationRunner.runAndExit(filePath: filePath, maxSeconds: maxSeconds)
+        // Support "--cli <filepath> [--max-seconds <N>] [--speakers <N>] [--json-out <path>]"
+        // for automated verification & batch processing
+        func optionValue(_ name: String) -> String? {
+            guard let idx = args.firstIndex(of: name), idx + 1 < args.count else { return nil }
+            return args[idx + 1]
+        }
+        let speakerMode = optionValue("--speakers").flatMap(Int.init).flatMap(SpeakerCountMode.init(rawValue:)) ?? .auto
+
+        if let filePath = optionValue("--cli") {
+            CLIVerificationRunner.runAndExit(
+                filePath: filePath,
+                maxSeconds: optionValue("--max-seconds").flatMap(Double.init),
+                speakerMode: speakerMode,
+                jsonOutPath: optionValue("--json-out")
+            )
+        }
+
+        // Support "--diarize <segments.json> <media>" to re-run speaker diarization on a saved transcript
+        if let idx = args.firstIndex(of: "--diarize"), idx + 2 < args.count {
+            CLIVerificationRunner.rediarizeAndExit(
+                segmentsJSONPath: args[idx + 1],
+                mediaPath: args[idx + 2],
+                speakerMode: speakerMode
+            )
         }
     }
 
     var body: some Scene {
-        WindowGroup("LocalSpeechSTT — ローカル音声・動画文字起こし (Apple Speech)") {
+        // Single main window: the app has one shared AppViewModel, so multiple windows would fight over it
+        Window("LocalSpeechSTT — ローカル音声・動画文字起こし (Apple Speech)", id: "main") {
             ContentView(viewModel: viewModel)
                 .frame(minWidth: 960, idealWidth: 1120, minHeight: 660, idealHeight: 760)
                 .onAppear {
@@ -103,7 +135,50 @@ struct LocalSpeechSTTApp: App {
 // MARK: - CLI Verification / Headless Test Runner
 
 enum CLIVerificationRunner {
-    static func runAndExit(filePath: String, maxSeconds: Double?) -> Never {
+    static func rediarizeAndExit(segmentsJSONPath: String, mediaPath: String, speakerMode: SpeakerCountMode) -> Never {
+        Task {
+            do {
+                let data = try Data(contentsOf: URL(fileURLWithPath: segmentsJSONPath))
+                let segments = try JSONDecoder().decode([TranscriptSegment].self, from: data)
+                let reader = try await MediaInspector.prepareAudioReader(for: URL(fileURLWithPath: mediaPath))
+                let t0 = Date()
+                let features = try DiarizationEngine.extractFeatures(url: reader.audioFileURL)
+                let t1 = Date()
+                let result = DiarizationEngine.diarize(segments: segments, features: features, mode: speakerMode)
+                let t2 = Date()
+                printSegments(result)
+                print(String(format: "\n=== %d -> %d segments, features %.2fs, diarization %.2fs ===",
+                             segments.count, result.count, t1.timeIntervalSince(t0), t2.timeIntervalSince(t1)))
+                printSpeakerSummary(result)
+                exit(0)
+            } catch {
+                fputs("Diarization Error: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+        }
+        RunLoop.main.run()
+        fatalError("Unreachable")
+    }
+
+    private static func printSegments(_ segments: [TranscriptSegment]) {
+        for seg in segments {
+            print("[\(seg.formattedTimeRange)] [話者 \(seg.speakerID)] \(seg.text)")
+        }
+    }
+
+    private static func printSpeakerSummary(_ segments: [TranscriptSegment]) {
+        var totals: [Int: (count: Int, seconds: Double)] = [:]
+        for seg in segments {
+            let cur = totals[seg.speakerID] ?? (0, 0)
+            totals[seg.speakerID] = (cur.count + 1, cur.seconds + seg.duration)
+        }
+        for spk in totals.keys.sorted() {
+            let v = totals[spk]!
+            print(String(format: "話者 %d: %d セグメント, %.1f 秒", spk, v.count, v.seconds))
+        }
+    }
+
+    static func runAndExit(filePath: String, maxSeconds: Double?, speakerMode: SpeakerCountMode, jsonOutPath: String?) -> Never {
         Task {
             do {
                 let inputURL = URL(fileURLWithPath: filePath)
@@ -145,7 +220,7 @@ enum CLIVerificationRunner {
                 let config = TranscriptionConfig(
                     engine: .speechTranscriber,
                     localeIdentifier: "ja_JP",
-                    speakerMode: .auto,
+                    speakerMode: speakerMode,
                     pauseThresholdSeconds: 0.45,
                     maxSegmentDurationSeconds: 14.0,
                     contextualStrings: [],
@@ -153,20 +228,30 @@ enum CLIVerificationRunner {
                 )
 
                 let t0 = Date()
-                let segments = try await SpeechRecognitionService.transcribeFile(
+                let result = try await SpeechRecognitionService.transcribeFile(
                     url: targetURL,
                     config: config
                 ) { update in
                     // Silent progress or occasional log
                     _ = update
                 }
+                let segments = result.segments
                 let elapsed = Date().timeIntervalSince(t0)
+
+                if let jsonOutPath {
+                    // Raw (pre-diarization speaker IDs are irrelevant) segments incl. tokens for --diarize experiments
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted]
+                    try encoder.encode(segments).write(to: URL(fileURLWithPath: jsonOutPath))
+                }
 
                 print("\n=== Transcription & Speaker Diarization Result (\(segments.count) segments in \(String(format: "%.2f", elapsed))s) ===")
                 for seg in segments {
                     let f0Str = seg.embedding.map { String(format: "%.0fHz", $0.f0Median) } ?? "N/A"
                     print("[\(seg.formattedTimeRange)] [話者 \(seg.speakerID) (\(f0Str))] \(seg.text)")
                 }
+
+                printSpeakerSummary(segments)
 
                 print("\n=== SRT Export Preview (First 3 items) ===")
                 let srt = ExportService.formatTranscript(
@@ -234,7 +319,7 @@ enum ScreenshotCaptureRunner {
                             enableEtiquetteReplacements: false
                         )
                         let t0 = Date()
-                        let segs = try await SpeechRecognitionService.transcribeFile(url: tmp, config: config) { _ in }
+                        let segs = try await SpeechRecognitionService.transcribeFile(url: tmp, config: config) { _ in }.segments
                         let elapsed = Date().timeIntervalSince(t0)
                         vm.segments = segs
                         vm.progressFraction = 1.0

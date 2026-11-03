@@ -137,78 +137,13 @@ struct ContentView: View {
     // MARK: - 2. Media Player & Waveform Card
 
     private var mediaPlayerSection: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Label("プレビュー再生", systemImage: "play.circle")
-                        .font(.headline)
-                    Spacer()
-                    Picker("速度", selection: Binding(
-                        get: { viewModel.playerManager.playbackRate },
-                        set: { viewModel.playerManager.setRate($0) }
-                    )) {
-                        Text("0.75x").tag(Float(0.75))
-                        Text("1.0x").tag(Float(1.0))
-                        Text("1.25x").tag(Float(1.25))
-                        Text("1.5x").tag(Float(1.5))
-                        Text("2.0x").tag(Float(2.0))
-                    }
-                    .pickerStyle(.menu)
-                    .frame(width: 85)
-                    .controlSize(.small)
-                }
-
-                if viewModel.mediaInfo?.hasVideo == true {
-                    NativeVideoPlayerView(player: viewModel.playerManager.player)
-                        .frame(height: 175)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-
-                // Interactive Waveform Seek Bar
-                WaveformTimelineView(
-                    peaks: viewModel.waveformPeaks,
-                    currentTime: viewModel.playerManager.currentTime,
-                    duration: max(0.1, viewModel.playerManager.duration)
-                ) { seekSeconds in
-                    viewModel.playerManager.seek(to: seekSeconds)
-                }
-                .frame(height: 44)
-
-                HStack(spacing: 10) {
-                    Button {
-                        viewModel.playerManager.seek(to: viewModel.playerManager.currentTime - 5.0)
-                    } label: {
-                        Image(systemName: "gobackward.5")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("5秒戻る")
-
-                    Button {
-                        viewModel.playerManager.togglePlayPause()
-                    } label: {
-                        Image(systemName: viewModel.playerManager.isPlaying ? "pause.fill" : "play.fill")
-                            .frame(width: 24)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-
-                    Button {
-                        viewModel.playerManager.seek(to: viewModel.playerManager.currentTime + 5.0)
-                    } label: {
-                        Image(systemName: "goforward.5")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("5秒進む")
-
-                    Spacer()
-
-                    Text("\(TimeFormatter.format(viewModel.playerManager.currentTime, includeMillis: false)) / \(TimeFormatter.format(viewModel.playerManager.duration, includeMillis: false))")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(4)
-        }
+        // The player is a separate ObservableObject: observe it directly so that the play state,
+        // playback position and speed picker refresh immediately.
+        MediaPlayerSectionView(
+            player: viewModel.playerManager,
+            hasVideo: viewModel.mediaInfo?.hasVideo == true,
+            waveformPeaks: viewModel.waveformPeaks
+        )
     }
 
     // MARK: - 3. STT Engine & Language Settings Card
@@ -289,13 +224,26 @@ struct ContentView: View {
                     Text("話者数モード (変更すると即座に再分離します)")
                         .font(.caption.bold())
                         .foregroundStyle(.secondary)
-                    Picker("話者数", selection: $viewModel.speakerMode) {
-                        ForEach(SpeakerCountMode.allCases) { mode in
-                            Text(mode.displayName).tag(mode)
+                    HStack(spacing: 6) {
+                        Picker("話者数", selection: $viewModel.speakerMode) {
+                            ForEach(SpeakerCountMode.allCases) { mode in
+                                Text(mode.displayName).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        if viewModel.isReclustering {
+                            ProgressView()
+                                .controlSize(.small)
+                                .help("話者を再分離しています...")
                         }
                     }
-                    .labelsHidden()
+                    if viewModel.isTranscribing {
+                        Text("文字起こし中は変更できません (完了後に変更すると即座に再分離します)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .disabled(viewModel.isTranscribing)
 
                 if viewModel.speakerMode != .off && !viewModel.detectedSpeakers.isEmpty {
                     Divider()
@@ -735,6 +683,102 @@ struct ContentView: View {
             }
         }
         return true
+    }
+}
+
+// MARK: - Media Player Card
+
+struct MediaPlayerSectionView: View {
+    @ObservedObject var player: MediaPlayerManager
+    let hasVideo: Bool
+    let waveformPeaks: [Float]
+
+    private static let rates: [Float] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label("プレビュー再生", systemImage: "play.circle")
+                        .font(.headline)
+                    Spacer()
+                    Picker("速度", selection: Binding(
+                        get: { player.playbackRate },
+                        set: { player.setRate($0) }
+                    )) {
+                        ForEach(Self.rates, id: \.self) { rate in
+                            Text(Self.rateLabel(rate)).tag(rate)
+                        }
+                        // Rates chosen from the native video controls that are not in the list
+                        if !Self.rates.contains(player.playbackRate) {
+                            Text(Self.rateLabel(player.playbackRate)).tag(player.playbackRate)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 85)
+                    .controlSize(.small)
+                }
+
+                if hasVideo {
+                    NativeVideoPlayerView(player: player.player)
+                        .frame(height: 175)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                // Interactive Waveform Seek Bar
+                WaveformTimelineView(
+                    peaks: waveformPeaks,
+                    currentTime: player.currentTime,
+                    duration: max(0.1, player.duration)
+                ) { seekSeconds in
+                    player.seek(to: seekSeconds)
+                }
+                .frame(height: 44)
+
+                HStack(spacing: 10) {
+                    Button {
+                        player.seek(to: player.currentTime - 5.0)
+                    } label: {
+                        Image(systemName: "gobackward.5")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("5秒戻る")
+
+                    Button {
+                        player.togglePlayPause()
+                    } label: {
+                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                            .frame(width: 24)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .keyboardShortcut(.space, modifiers: [.option])
+                    .help("再生 / 一時停止 (⌥Space)")
+
+                    Button {
+                        player.seek(to: player.currentTime + 5.0)
+                    } label: {
+                        Image(systemName: "goforward.5")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("5秒進む")
+
+                    Spacer()
+
+                    Text("\(TimeFormatter.format(player.currentTime, includeMillis: false)) / \(TimeFormatter.format(player.duration, includeMillis: false))")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(4)
+        }
+    }
+
+    private static func rateLabel(_ rate: Float) -> String {
+        let text = String(format: "%.2f", rate)
+            .replacingOccurrences(of: "0+$", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\\.$", with: ".0", options: .regularExpression)
+        return text + "x"
     }
 }
 

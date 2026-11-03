@@ -87,7 +87,7 @@ enum ExportFormat: String, CaseIterable, Identifiable, Sendable {
 
 // MARK: - Token & Segment Models
 
-struct TranscriptToken: Sendable, Equatable {
+struct TranscriptToken: Sendable, Equatable, Codable {
     var text: String
     var startTime: Double
     var endTime: Double
@@ -132,6 +132,9 @@ struct TranscriptSegment: Identifiable, Equatable, Sendable, Codable {
     var speakerID: Int
     var confidence: Double?
     var embedding: AcousticEmbedding?
+    /// Word/character-level tokens with timestamps (nil once the text has been edited by hand).
+    /// Used by the diarizer to split an utterance at speaker change points.
+    var tokens: [TranscriptToken]? = nil
 
     var duration: Double {
         max(0, endTime - startTime)
