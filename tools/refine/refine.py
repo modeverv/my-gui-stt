@@ -38,7 +38,23 @@ EMBEDDING_MODELS = {
     "resnet34": MODELS / "wespeaker_en_voxceleb_resnet34_LM.onnx",
 }
 
+EMBEDDING_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+
 PUNCT = set("。、？！?!,.，")
+
+
+def ensure_embedding_model(name: str) -> Path:
+    """Downloads the speaker embedding model on first use (it is not checked into git)."""
+    path = EMBEDDING_MODELS[name]
+    if not path.exists():
+        import urllib.request
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        print(f"downloading {path.name} ...", flush=True)
+        urllib.request.urlretrieve(EMBEDDING_URL + path.name, tmp)
+        tmp.rename(path)
+    return path
 
 
 # ----------------------------------------------------------------------------- utils
@@ -208,7 +224,7 @@ def stage_neural_diarization(wav: Path, raw_segments: list[dict], work: Path, ti
     emb = np.load(out)["emb"] if out.exists() else None
     if emb is None or len(emb) != len(wins):   # cache from a different transcript -> recompute
         extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
-            sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(EMBEDDING_MODELS[embedding]), num_threads=6))
+            sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(ensure_embedding_model(embedding)), num_threads=6))
         audio, sr = sf.read(str(wav), dtype="float32")
         t0 = time.time()
         vecs = []
