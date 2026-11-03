@@ -583,8 +583,11 @@ final class AppViewModel: ObservableObject {
         case .term:
             guard let from = sug.original, let to = useCustom ? custom : sug.candidate else { return }
             undoSnapshots[sug.id] = replaceEverywhere(from, with: to)
-            glossary.approve(from: from, to: to)
-            glossary.save()
+            // Risky (short) terms fix this transcript only and are not remembered for future files
+            if TermReplacer.glossaryRisk(for: from) == nil {
+                glossary.approve(from: from, to: to)
+                glossary.save()
+            }
         case .span:
             guard let segID = sug.segmentID, let idx = segments.firstIndex(where: { $0.id == segID }),
                   let original = sug.original, let replacement = useCustom ? custom : sug.candidate else { return }
@@ -637,22 +640,26 @@ final class AppViewModel: ObservableObject {
     /// "This is wrong, it should be ..." — the reviewer's own correction, applied to the whole transcript
     /// and remembered in the glossary for future files.
     @discardableResult
-    func applyManualCorrection(from: String, to: String) -> Int {
+    func applyManualCorrection(from: String, to: String) -> (count: Int, savedToGlossary: Bool) {
         let from = from.trimmingCharacters(in: .whitespacesAndNewlines)
         let to = to.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !from.isEmpty, from != to else { return 0 }
+        guard !from.isEmpty, from != to else { return (0, false) }
         let count = occurrenceCount(of: from)
-        guard count > 0 else { return 0 }
+        guard count > 0 else { return (0, false) }
+        let risky = TermReplacer.glossaryRisk(for: from) != nil
         let sug = CorrectionSuggestion(
             id: UUID(), kind: .term, status: .edited,
             segmentIDs: segments.filter { TermReplacer.occurrences(of: from, in: $0.text) > 0 }.map(\.id),
-            original: from, candidate: to, recommended: nil, note: "手動で指摘", resolvedText: to
+            original: from, candidate: to, recommended: nil,
+            note: risky ? "手動で指摘 (この書き起こしのみ・辞書には未登録)" : "手動で指摘", resolvedText: to
         )
         undoSnapshots[sug.id] = replaceEverywhere(from, with: to)
         suggestions.insert(sug, at: 0)
-        glossary.approve(from: from, to: to)
-        glossary.save()
-        return count
+        if !risky {
+            glossary.approve(from: from, to: to)
+            glossary.save()
+        }
+        return (count, !risky)
     }
 
     func occurrenceCount(of term: String) -> Int {
@@ -685,18 +692,11 @@ final class AppViewModel: ObservableObject {
         guard !glossary.approved.isEmpty else { return (input, 0) }
         var output = input
         var hits = 0
-        let entries = glossary.approved.sorted { $0.from.count > $1.from.count }
         for i in output.indices {
-            var text = output[i].text
-            for entry in entries {
-                let n = TermReplacer.occurrences(of: entry.from, in: text)
-                if n > 0 {
-                    hits += n
-                    text = TermReplacer.replace(entry.from, with: entry.to, in: text)
-                }
-            }
-            if text != output[i].text {
-                output[i].text = text
+            let result = TermReplacer.apply(glossary.approved, to: output[i].text)
+            if result.hits > 0 {
+                hits += result.hits
+                output[i].text = result.text
                 output[i].tokens = nil
             }
         }

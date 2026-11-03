@@ -564,13 +564,21 @@ def progress(fraction: float, message: str) -> None:
     print(f"PROGRESS {fraction:.3f} {message}", flush=True)
 
 
+KATAKANA = "\u30A1-\u30FA\u30FC-\u30FF\uFF66-\uFF9F"
+
+
 def term_pattern(src: str) -> re.Pattern:
-    """Replace `src` only as a whole token when it is Latin/digits (so "LL" never hits "LLMIPI")."""
+    """Match `src` only as a whole word: Latin/digit edges must not touch Latin/digits ("LL" never hits
+    "LLMIPI"), katakana edges must not touch katakana ("クロード" never hits "クロードフォメーション")."""
     esc = re.escape(src)
     if re.match(r"^[A-Za-z0-9]", src):
         esc = r"(?<![A-Za-z0-9])" + esc
+    elif re.match(f"^[{KATAKANA}]", src):
+        esc = f"(?<![{KATAKANA}])" + esc
     if re.search(r"[A-Za-z0-9]$", src):
         esc = esc + r"(?![A-Za-z0-9])"
+    elif re.search(f"[{KATAKANA}]$", src):
+        esc = esc + f"(?![{KATAKANA}])"
     return re.compile(esc)
 
 

@@ -95,8 +95,10 @@ struct Glossary: Codable, Equatable, Sendable {
 // MARK: - Term Replacement
 
 enum TermReplacer {
-    /// Replaces `from` with `to`. Latin/digit edges only match at word boundaries, so "LL" never
-    /// rewrites the inside of "LLMIPI" (the same rule as tools/refine/refine.py `term_pattern`).
+    /// Replaces `from` with `to` only where `from` is a whole word:
+    /// - Latin/digit edges must not touch other Latin letters or digits ("LL" never hits "LLMIPI")
+    /// - Katakana edges must not touch other katakana ("クロード" never hits "クロードフォメーション")
+    /// The same rule is implemented in tools/refine/refine.py `term_pattern`.
     static func replace(_ from: String, with to: String, in text: String) -> String {
         guard !from.isEmpty, let regex = try? NSRegularExpression(pattern: pattern(for: from)) else { return text }
         let range = NSRange(text.startIndex..., in: text)
@@ -108,15 +110,55 @@ enum TermReplacer {
         return regex.numberOfMatches(in: text, range: NSRange(text.startIndex..., in: text))
     }
 
+    /// Applies several terms, longest first, so that a longer entry wins over a shorter one it contains.
+    static func apply(_ entries: [GlossaryEntry], to text: String) -> (text: String, hits: Int) {
+        var text = text
+        var hits = 0
+        for entry in entries.sorted(by: { $0.from.count > $1.from.count }) {
+            let n = occurrences(of: entry.from, in: text)
+            if n > 0 {
+                hits += n
+                text = replace(entry.from, with: entry.to, in: text)
+            }
+        }
+        return (text, hits)
+    }
+
+    private static let latin = "A-Za-z0-9"
+    private static let katakana = "\\u30A1-\\u30FA\\u30FC-\\u30FF\\uFF66-\\uFF9F"
+
     private static func pattern(for from: String) -> String {
         var p = NSRegularExpression.escapedPattern(for: from)
-        if let first = from.unicodeScalars.first, isLatinOrDigit(first) { p = "(?<![A-Za-z0-9])" + p }
-        if let last = from.unicodeScalars.last, isLatinOrDigit(last) { p += "(?![A-Za-z0-9])" }
+        if let first = from.unicodeScalars.first {
+            if isLatinOrDigit(first) { p = "(?<![\(latin)])" + p }
+            else if isKatakana(first) { p = "(?<![\(katakana)])" + p }
+        }
+        if let last = from.unicodeScalars.last {
+            if isLatinOrDigit(last) { p += "(?![\(latin)])" }
+            else if isKatakana(last) { p += "(?![\(katakana)])" }
+        }
         return p
     }
 
     private static func isLatinOrDigit(_ s: Unicode.Scalar) -> Bool {
         (s >= "A" && s <= "Z") || (s >= "a" && s <= "z") || (s >= "0" && s <= "9")
+    }
+
+    static func isKatakana(_ s: Unicode.Scalar) -> Bool {
+        (0x30A1...0x30FA).contains(s.value) || (0x30FC...0x30FF).contains(s.value) || (0xFF66...0xFF9F).contains(s.value)
+    }
+
+    /// Why registering `from` in the glossary could damage future transcripts, or nil if it looks safe.
+    static func glossaryRisk(for from: String) -> String? {
+        let trimmed = from.trimmingCharacters(in: .whitespacesAndNewlines)
+        let scalars = Array(trimmed.unicodeScalars)
+        if scalars.count <= 2 {
+            return "「\(trimmed)」は短すぎるため、他の語の一部を書き換える危険があります"
+        }
+        if scalars.count <= 3, scalars.allSatisfy({ isKatakana($0) }) {
+            return "「\(trimmed)」は短いカタカナ語のため、他のカタカナ語の一部を書き換える危険があります"
+        }
+        return nil
     }
 }
 

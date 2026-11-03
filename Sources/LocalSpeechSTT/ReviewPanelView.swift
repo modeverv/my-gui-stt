@@ -95,13 +95,19 @@ struct ReviewPanelView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(hits > 0 ? Color.primary : Color.secondary)
                     .frame(minWidth: 44, alignment: .leading)
-                Button("全体に適用して辞書に登録", action: applyManual)
+                Button(TermReplacer.glossaryRisk(for: ui.manualFrom) == nil ? "全体に適用して辞書に登録" : "この書き起こしにだけ適用", action: applyManual)
                     .disabled(hits == 0 || ui.manualTo.trimmingCharacters(in: .whitespaces).isEmpty)
                 Spacer()
             }
-            Text(ui.manualFeedback ?? "英字の語は単語の境界でだけ置換します (LL → LLM は LLMIPI の中を変えません)。登録した表記は次回の文字起こしにも使われます。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            if let risk = TermReplacer.glossaryRisk(for: ui.manualFrom), !ui.manualFrom.isEmpty {
+                Label(risk + "。この書き起こしにだけ適用し、用語辞書には登録しません。", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(Color.orange)
+            } else {
+                Text(ui.manualFeedback ?? "語の途中は置換しません (LL → LLM は LLMIPI を、クロード → Claude はクロードフォメーションを変えません)。登録した表記は次回の文字起こしにも使われます。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -109,9 +115,11 @@ struct ReviewPanelView: View {
     }
 
     private func applyManual() {
-        let n = viewModel.applyManualCorrection(from: ui.manualFrom, to: ui.manualTo)
-        if n > 0 {
-            ui.manualFeedback = "「\(ui.manualFrom)」→「\(ui.manualTo)」を \(n) 箇所に適用し、用語辞書に登録しました (下の一覧から取り消せます)"
+        let result = viewModel.applyManualCorrection(from: ui.manualFrom, to: ui.manualTo)
+        if result.count > 0 {
+            ui.manualFeedback = "「\(ui.manualFrom)」→「\(ui.manualTo)」を \(result.count) 箇所に適用しました"
+                + (result.savedToGlossary ? "。用語辞書にも登録しました" : " (短い語のため辞書には未登録)")
+                + "。下の一覧から取り消せます"
             ui.manualFrom = ""
             ui.manualTo = ""
         }
@@ -242,6 +250,11 @@ struct SuggestionRowView: View {
                 Text(suggestion.resolvedText ?? suggestion.candidate ?? "").fontWeight(.semibold)
             }
             .font(.title3)
+            if let risk = TermReplacer.glossaryRisk(for: suggestion.original ?? ""), suggestion.status == .pending {
+                Label(risk + "。採用してもこの書き起こしにだけ適用し、辞書には登録しません。", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(Color.orange)
+            }
             if let seg = segment {
                 Text(highlighted(seg.text, term: suggestion.status == .pending ? suggestion.original : (suggestion.resolvedText ?? suggestion.candidate)))
                     .font(.callout)
@@ -343,7 +356,8 @@ struct SuggestionRowView: View {
 
     private var acceptLabel: String {
         switch suggestion.kind {
-        case .term: return "全体に適用 (辞書に登録)"
+        case .term:
+            return TermReplacer.glossaryRisk(for: suggestion.original ?? "") == nil ? "全体に適用 (辞書に登録)" : "この書き起こしにだけ適用"
         case .span: return "B を採用"
         case .speaker: return "\(viewModel.speakerDisplayName(for: suggestion.alternative ?? 1)) に変更"
         }
