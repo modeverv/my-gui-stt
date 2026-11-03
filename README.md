@@ -2,7 +2,11 @@
 
 macOSネイティブ（SwiftUI + Apple `Speech` / `Accelerate` フレームワーク）で動作する、完全ローカル完結型の動画・音声文字起こし（STT）アプリケーションです。外部APIやクラウド通信を一切行わず、Appleオンデバイス音声認識エンジンを用いて高速に文字起こし・タイムスタンプ付与・話者分離を行います。
 
-![LocalSpeechSTT アプリ画面スクリーンショット](docs/screenshot.png)
+![LocalSpeechSTT メイン画面: 2人の対話を話者分離した文字起こし](docs/screenshot.png)
+
+![LocalSpeechSTT 補正レビュー画面: ローカルLLMの補正候補を人間が採用・却下する](docs/screenshot-review.png)
+
+<sub>スクリーンショットの音声は、架空の台本を macOS の音声合成 (Kyoko / Otoya) で読み上げたデモです。</sub>
 
 ## 主な機能
 
