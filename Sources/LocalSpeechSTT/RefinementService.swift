@@ -124,12 +124,15 @@ enum TermReplacer {
 
 enum RefinementError: LocalizedError {
     case toolsNotFound
+    case uvNotFound
     case failed(String)
 
     var errorDescription: String? {
         switch self {
         case .toolsNotFound:
             return "補正ツール (tools/refine) が見つかりません。リポジトリの tools/refine を LocalSpeechSTT.app と同じ階層に置いてください。"
+        case .uvNotFound:
+            return "uv が見つかりません。uv をインストールするか、ターミナルで `defaults write com.local.speechstt.app uvPath /path/to/uv` を実行して場所を指定してください。"
         case .failed(let message):
             return "高精度補正に失敗しました: \(message)"
         }
@@ -137,9 +140,66 @@ enum RefinementError: LocalizedError {
 }
 
 /// Runs the local refinement pipeline (`tools/refine/refine.py`: Whisper + neural speaker embeddings
-/// + Gemma) as a subprocess through the user's login shell, so that `uv` and `ffmpeg` are found
-/// on the same PATH as in Terminal.
+/// + Gemma) as a subprocess. Apps launched from Finder get a minimal PATH and version managers such
+/// as mise only activate in interactive shells, so `uv` is located explicitly and the subprocess gets
+/// a PATH that also contains the usual tool directories (for `ffmpeg`).
 enum RefinementService {
+    static func uvExecutable() -> URL? {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        var candidates: [String] = []
+        if let custom = UserDefaults.standard.string(forKey: "uvPath"), !custom.isEmpty {
+            candidates.append(custom)
+        }
+        candidates += [
+            "\(home)/.local/bin/uv",
+            "/opt/homebrew/bin/uv",
+            "/usr/local/bin/uv",
+            "\(home)/.cargo/bin/uv",
+        ]
+        // mise: ~/.local/share/mise/installs/<tool>/<version>/[bin/]uv (newest version first)
+        let miseInstalls = "\(home)/.local/share/mise/installs"
+        for tool in (try? fm.contentsOfDirectory(atPath: miseInstalls)) ?? [] {
+            let versions = ((try? fm.contentsOfDirectory(atPath: "\(miseInstalls)/\(tool)")) ?? [])
+                .sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+            for version in versions {
+                candidates.append("\(miseInstalls)/\(tool)/\(version)/bin/uv")
+                candidates.append("\(miseInstalls)/\(tool)/\(version)/uv")
+            }
+        }
+        if let found = candidates.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            return URL(fileURLWithPath: found)
+        }
+        // Last resort: ask an interactive shell (reads ~/.zshrc, where version managers are activated)
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        probe.arguments = ["-ic", "command -v uv"]
+        let pipe = Pipe()
+        probe.standardOutput = pipe
+        probe.standardError = FileHandle.nullDevice
+        guard (try? probe.run()) != nil else { return nil }
+        probe.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Prompt/terminal-integration escape sequences may surround the answer: keep the last absolute path
+        if let range = output.range(of: #"/[^\s\u{07}\u{1B}]*/uv(?=\s*$)"#, options: .regularExpression),
+           fm.isExecutableFile(atPath: String(output[range])) {
+            return URL(fileURLWithPath: String(output[range]))
+        }
+        return nil
+    }
+
+    /// PATH for the subprocess: uv's own directory plus the common tool locations (ffmpeg).
+    private static func subprocessEnvironment(uv: URL) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dirs = [uv.deletingLastPathComponent().path, "\(home)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin",
+                    "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        let existing = (env["PATH"] ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        env["PATH"] = (dirs + existing).filter { seen.insert($0).inserted }.joined(separator: ":")
+        return env
+    }
+
     static func toolsDirectory() -> URL? {
         var candidates: [URL] = []
         if let custom = UserDefaults.standard.string(forKey: "refineToolsPath"), !custom.isEmpty {
@@ -188,11 +248,13 @@ enum RefinementService {
         default: speakers = speakerMode.rawValue
         }
 
+        guard let uv = uvExecutable() else { throw RefinementError.uvNotFound }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.executableURL = uv
+        process.currentDirectoryURL = tools
+        process.environment = subprocessEnvironment(uv: uv)
         process.arguments = [
-            "-lc", #"cd "$1" && shift && exec uv run --quiet python refine.py "$@""#, "zsh",
-            tools.path,
+            "run", "--quiet", "--project", tools.path, "python", tools.appendingPathComponent("refine.py").path,
             "--raw", rawURL.path,
             "--media", media.path,
             "--work-dir", work.path,

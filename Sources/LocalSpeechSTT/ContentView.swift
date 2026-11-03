@@ -466,23 +466,26 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
                 )
-                .frame(maxWidth: 260)
+                .frame(minWidth: 150, maxWidth: 260)
 
                 Spacer()
 
                 Toggle("タイムスタンプ", isOn: $viewModel.showTimestamps)
                     .toggleStyle(.checkbox)
                     .font(.caption)
+                    .fixedSize()
 
                 if viewModel.speakerMode != .off {
                     Toggle("話者ラベル", isOn: $viewModel.showSpeakers)
                         .toggleStyle(.checkbox)
                         .font(.caption)
+                        .fixedSize()
                 }
 
                 Toggle("同一話者を結合", isOn: $viewModel.mergeConsecutiveSameSpeaker)
                     .toggleStyle(.checkbox)
                     .font(.caption)
+                    .fixedSize()
             }
 
             // Speaker Filter Pills
