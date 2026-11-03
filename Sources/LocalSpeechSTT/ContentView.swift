@@ -15,6 +15,7 @@ struct ContentView: View {
                     }
                     sttSettingsSection
                     speakerDiarizationSection
+                    glossarySection
                 }
                 .padding(14)
             }
@@ -290,6 +291,60 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - 5. Glossary Card
+
+    private var glossarySection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("用語辞書", systemImage: "character.book.closed")
+                        .font(.headline)
+                    Spacer()
+                    Text("承認 \(viewModel.glossary.approved.count) • 却下 \(viewModel.glossary.rejected.count)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Text("補正レビューで承認した表記は、次回以降の文字起こしで認識ヒントに使われ、自動で置換されます。却下した候補は二度と提案されません。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if !viewModel.glossary.approved.isEmpty || !viewModel.glossary.rejected.isEmpty {
+                    DisclosureGroup("登録内容を表示") {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(viewModel.glossary.approved) { entry in
+                                glossaryRow(entry, approved: true)
+                            }
+                            ForEach(viewModel.glossary.rejected) { entry in
+                                glossaryRow(entry, approved: false)
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+                    .font(.caption)
+                }
+            }
+            .padding(4)
+        }
+    }
+
+    private func glossaryRow(_ entry: GlossaryEntry, approved: Bool) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: approved ? "checkmark.circle.fill" : "xmark.circle")
+                .foregroundStyle(approved ? Color.green : Color.secondary)
+            Text(entry.from).strikethrough(approved, color: .secondary)
+            Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
+            Text(entry.to).fontWeight(approved ? .semibold : .regular)
+            Spacer()
+            Button {
+                viewModel.removeGlossaryEntry(entry)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help("辞書から削除")
+        }
+        .font(.caption)
+    }
+
     // MARK: - Right Top Execution Bar
 
     private var topExecutionBar: some View {
@@ -323,7 +378,25 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(viewModel.mediaInfo == nil)
+                .disabled(viewModel.mediaInfo == nil || viewModel.isRefining)
+
+                if viewModel.isRefining {
+                    Button(role: .destructive) {
+                        viewModel.cancelRefinement()
+                    } label: {
+                        Label("補正を中止", systemImage: "xmark.circle")
+                    }
+                    .controlSize(.large)
+                } else {
+                    Button {
+                        viewModel.startRefinement()
+                    } label: {
+                        Label("高精度補正", systemImage: "wand.and.stars")
+                    }
+                    .controlSize(.large)
+                    .disabled(!viewModel.canRefine)
+                    .help("Whisper・ニューラル話者埋め込み・ローカルLLM (Gemma) で補正候補を作り、補正レビューで確認します (46分の音声で約10分・すべてローカル)")
+                }
             }
 
             VStack(alignment: .leading, spacing: 5) {
@@ -341,7 +414,7 @@ struct ContentView: View {
                             .foregroundStyle(Color.accentColor)
                             .clipShape(Capsule())
                     }
-                    if viewModel.isTranscribing {
+                    if viewModel.isTranscribing || viewModel.isRefining {
                         Text(String(format: "%.0f%%", viewModel.progressFraction * 100))
                             .font(.system(.caption, design: .monospaced).bold())
                     }
@@ -367,7 +440,8 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 240)
+                .labelsHidden()
+                .frame(width: 330)
 
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
@@ -515,6 +589,8 @@ struct ContentView: View {
                 timelineSegmentListView
             case .fullText:
                 fullTextPreviewView
+            case .review:
+                ReviewPanelView(viewModel: viewModel)
             }
         }
     }

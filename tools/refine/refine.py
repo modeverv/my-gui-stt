@@ -205,9 +205,8 @@ def stage_neural_diarization(wav: Path, raw_segments: list[dict], work: Path, ti
 
     regions = speech_regions(raw_segments)
     wins = windows_for(regions)
-    if out.exists():
-        emb = np.load(out)["emb"]
-    else:
+    emb = np.load(out)["emb"] if out.exists() else None
+    if emb is None or len(emb) != len(wins):   # cache from a different transcript -> recompute
         extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
             sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(EMBEDDING_MODELS[embedding]), num_threads=6))
         audio, sr = sf.read(str(wav), dtype="float32")
@@ -320,6 +319,7 @@ def assign_speakers_to_tokens(raw_segments: list[dict], neural: dict) -> list[di
             "text": "".join(t.text for t in toks).strip(),
             "speaker": int(labels[i]),
             "source_segment": units[i].seg_index,
+            "tokens": [{"text": t.text, "startTime": t.start, "endTime": t.end} for t in toks],
         })
         i = j + 1
     return canonical_speakers(out)
@@ -341,7 +341,7 @@ SPAN_PROMPT = """あなたは日本語ポッドキャストの音声認識結果
 判断材料: 前後の文脈・日本語として自然か・話題(収録の題名)。迷ったら "A"。
 出力は JSON オブジェクトのみ: {"ID": {"番号": "A" または "B", ...}, ...}  説明は書かない。"""
 
-TERMS_PROMPT = """あなたは日本語ポッドキャストの書き起こしの校正者です。
+TERMS_PROMPT = """あなたは日本語の書き起こしの校正者です。
 以下は音声認識の結果で、技術用語・製品名・サービス名・人名などがカタカナや誤った表記になっていることがあります。
 本文に実際に出てくる語句のうち、正しい表記が確実に分かるものだけを、誤表記→正表記の対応表にしてください。
 - 収録の題名や文脈から確実に判断できるものに限る。推測で人名を作らない
@@ -557,18 +557,188 @@ def stage_report(baseline: list[dict], refined: list[dict], whisper: dict, work:
     return report
 
 
+# ----------------------------------------------------------------------------- 5. app review
+
+def progress(fraction: float, message: str) -> None:
+    """Machine-readable progress line consumed by the app."""
+    print(f"PROGRESS {fraction:.3f} {message}", flush=True)
+
+
+def term_pattern(src: str) -> re.Pattern:
+    """Replace `src` only as a whole token when it is Latin/digits (so "LL" never hits "LLMIPI")."""
+    esc = re.escape(src)
+    if re.match(r"^[A-Za-z0-9]", src):
+        esc = r"(?<![A-Za-z0-9])" + esc
+    if re.search(r"[A-Za-z0-9]$", src):
+        esc = esc + r"(?![A-Za-z0-9])"
+    return re.compile(esc)
+
+
+def apply_terms(text: str, terms: list[dict]) -> tuple[str, list[list[str]]]:
+    applied = []
+    for t in sorted(terms, key=lambda t: -len(t["from"])):
+        new = term_pattern(t["from"]).sub(t["to"], text)
+        if new != text:
+            applied.append([t["from"], t["to"]])
+            text = new
+    return text, applied
+
+
+def suggest_terms(model, tokenizer, segments: list[dict], hint: str, glossary: list[dict],
+                  rejected: set[tuple[str, str]]) -> dict[str, str]:
+    full = "\n".join(s["text"] for s in segments)
+    known = "、".join(sorted({g["to"] for g in glossary}))
+    terms: dict[str, str] = {}
+    chunk = 2500
+    n = max(1, (len(full) + chunk - 1) // chunk)
+    for idx, ci in enumerate(range(0, len(full), chunk)):
+        progress(0.62 + 0.13 * idx / n, f"Gemma: 用語の候補を抽出中 ({idx + 1}/{n})")
+        prompt = f"{TERMS_PROMPT}\n\n収録の題名: {hint}\n"
+        if known:
+            prompt += f"既知の正しい用語(参考): {known}\n"
+        prompt += f"\n本文:\n{full[ci:ci + chunk]}"
+        for k, v in parse_json_object(chat(model, tokenizer, prompt, prefill="{", max_tokens=400)).items():
+            k, v = str(k).strip(), str(v).strip()
+            if len(k) >= 2 and k != v and v and k in full and (k, v) not in rejected and k not in terms:
+                terms[k] = v
+    return terms
+
+
+def adjudicate_spans(model, tokenizer, segments: list[dict], items: list[dict], hint: str,
+                     batch_size: int = 8) -> dict[int, dict]:
+    todo = [it for it in items if it["spans"]]
+    choices: dict[int, dict] = {}
+    for bi in range(0, len(todo), batch_size):
+        progress(0.75 + 0.23 * bi / max(1, len(todo)), f"Gemma: 食い違い箇所を判定中 ({bi}/{len(todo)})")
+        batch = todo[bi:bi + batch_size]
+        lines = [SPAN_PROMPT, "", f"収録の題名: {hint}", ""]
+        for it in batch:
+            marked, pos = [], 0
+            for n, sp in enumerate(it["spans"], 1):
+                marked.append(it["apple"][pos:sp["start"]] + f"[{n}]")
+                pos = sp["end"]
+            marked.append(it["apple"][pos:])
+            prev = segments[it["id"] - 1]["text"][-30:] if it["id"] > 0 else ""
+            lines.append(f"ID {it['id']}")
+            if prev:
+                lines.append(f"  直前: {prev}")
+            lines.append(f"  文: {''.join(marked)}")
+            for n, sp in enumerate(it["spans"], 1):
+                lines.append(f"  [{n}] A「{sp['a']}」 / B「{sp['b']}」")
+        parsed = parse_json_object(chat(model, tokenizer, "\n".join(lines), prefill="{",
+                                        max_tokens=60 * len(batch) + 40))
+        for it in batch:
+            c = parsed.get(str(it["id"]))
+            choices[it["id"]] = c if isinstance(c, dict) else {}
+    return choices
+
+
+def build_app_review(raw: list[dict], media: Path, work: Path, timer: Timer, speakers: int,
+                     glossary_path: Path | None) -> dict:
+    """Everything the app needs for its human review screen."""
+    import uuid
+
+    glossary = load_json(glossary_path) if glossary_path and glossary_path.exists() else {}
+    approved = [t for t in glossary.get("approved", []) if t.get("from") and t.get("to")]
+    rejected = {(t["from"], t["to"]) for t in glossary.get("rejected", []) if t.get("from")}
+    hint = media.stem
+
+    progress(0.01, "音声を準備中")
+    wav = decode_audio(media, work)
+    progress(0.03, "Whisper で2回目の文字起こし中 (最も時間がかかります)")
+    whisper = stage_whisper(wav, work, timer)
+
+    if speakers == 0:
+        segs = [{"start": s["startTime"], "end": s["endTime"], "text": s["text"], "speaker": s.get("speakerID", 1),
+                 "tokens": s.get("tokens")} for s in raw]
+    else:
+        progress(0.45, "ニューラル話者埋め込みを計算中")
+        neural = stage_neural_diarization(wav, raw, work, timer, "eres2net", speakers)
+        segs = assign_speakers_to_tokens(raw, neural)
+    # speaker IDs aligned with the app's current labels, disagreements become suggestions
+    base = [{"start": s["startTime"], "end": s["endTime"], "speaker": s.get("speakerID", 1)} for s in raw]
+    grid_a, grid_b = [], []
+    for s in segs:
+        t = s["start"]
+        while t < s["end"]:
+            grid_a.append(speaker_at(base, t))
+            grid_b.append(s["speaker"])
+            t += 0.1
+    mp = best_mapping(grid_a, grid_b)
+    for s in segs:
+        s["speaker"] = mp.get(s["speaker"], s["speaker"])
+
+    # approved glossary terms are applied deterministically (tokens no longer match -> dropped)
+    auto_applied = []
+    for s in segs:
+        new, applied = apply_terms(s["text"], approved)
+        if applied:
+            s["text"] = new
+            s["tokens"] = None
+            auto_applied.extend(applied)
+
+    progress(0.6, "Gemma を読み込み中")
+    from mlx_lm import load
+    t0 = time.time()
+    model, tokenizer = load(GEMMA_REPO)
+    terms = suggest_terms(model, tokenizer, segs, hint, approved, rejected)
+    items = []
+    for i, s in enumerate(segs):
+        wt = whisper_text_between(whisper["words"], s["start"] + TOKEN_TIME_SHIFT, s["end"] + TOKEN_TIME_SHIFT)
+        items.append({"id": i, "apple": s["text"], "whisper": wt, "spans": diff_spans(s["text"], wt)})
+    choices = adjudicate_spans(model, tokenizer, segs, items, hint)
+    timer.record("gemma_app_review", time.time() - t0)
+
+    out_segments, suggestions = [], []
+    for i, s in enumerate(segs):
+        sid = str(uuid.uuid4()).upper()
+        out_segments.append({
+            "id": sid, "index": i + 1, "startTime": s["start"], "endTime": s["end"], "text": s["text"],
+            "speakerID": int(s["speaker"]), "tokens": s.get("tokens"),
+        })
+        alt = speaker_at(base, (s["start"] + s["end"]) / 2)
+        if alt is not None and alt != s["speaker"] and speakers != 0:
+            suggestions.append({"kind": "speaker", "segmentID": sid, "current": int(s["speaker"]),
+                                "alternative": int(alt), "note": "現行の音響モデルでは別の話者"})
+        for n, sp in enumerate(items[i]["spans"], 1):
+            pick = str(choices.get(i, {}).get(str(n), "A")).upper()
+            suggestions.append({"kind": "span", "segmentID": sid, "offset": sp["start"],
+                                "length": sp["end"] - sp["start"], "original": sp["a"], "candidate": sp["b"],
+                                "recommended": pick == "B", "context": s["text"]})
+    for k, v in terms.items():
+        occ = [seg["id"] for seg in out_segments if term_pattern(k).search(seg["text"])]
+        if occ:
+            suggestions.append({"kind": "term", "original": k, "candidate": v, "segmentIDs": occ,
+                                "recommended": True})
+    for sug in suggestions:
+        sug["id"] = str(uuid.uuid4()).upper()
+        sug["status"] = "pending"
+    progress(1.0, "完了")
+    return {"segments": out_segments, "suggestions": suggestions, "autoAppliedTerms": auto_applied,
+            "timings": load_json(work / "timings.json")}
+
+
 # ----------------------------------------------------------------------------- main
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--raw", type=Path, required=True, help="Apple STT segments JSON (--speakers 0 --json-out)")
-    ap.add_argument("--baseline", type=Path, required=True, help="current app diarization JSON (for comparison)")
+    ap.add_argument("--baseline", type=Path, help="current app diarization JSON (for comparison, evaluation mode)")
     ap.add_argument("--media", type=Path, required=True)
     ap.add_argument("--work-dir", type=Path, required=True)
     ap.add_argument("--embedding", choices=list(EMBEDDING_MODELS), default="eres2net")
     ap.add_argument("--speakers", type=int, default=-1, help="-1 = auto")
     ap.add_argument("--stages", default="whisper,speakers,correct,report")
+    ap.add_argument("--app-review", type=Path, help="write the app's review JSON here (app integration mode)")
+    ap.add_argument("--glossary", type=Path, help="approved/rejected term dictionary maintained by the app")
     args = ap.parse_args()
+
+    if args.app_review:
+        args.work_dir.mkdir(parents=True, exist_ok=True)
+        review = build_app_review(load_json(args.raw), args.media, args.work_dir, Timer(args.work_dir),
+                                  args.speakers, args.glossary)
+        save_json(args.app_review, review)
+        return
 
     work = args.work_dir
     work.mkdir(parents=True, exist_ok=True)
