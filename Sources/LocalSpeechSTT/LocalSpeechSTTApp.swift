@@ -373,6 +373,15 @@ enum ScreenshotCaptureRunner {
                     }
                 }
 
+                // Optional (README screenshots): show a saved refinement review. Display only — nothing is applied or saved.
+                if let reviewPath = ProcessInfo.processInfo.environment["LSTT_REVIEW_JSON"] {
+                    let review = try JSONDecoder().decode(RefinementReview.self, from: Data(contentsOf: URL(fileURLWithPath: reviewPath)))
+                    vm.segments = review.segments
+                    vm.suggestions = review.suggestions.sorted(by: AppViewModel.reviewOrder)
+                    vm.viewMode = .review
+                    vm.statusMessage = String(format: "高精度補正完了 • 確認待ち %d 件", vm.pendingSuggestionCount)
+                }
+
                 let winRect = NSRect(x: 100, y: 100, width: 1180, height: 780)
                 let window = NSWindow(
                     contentRect: winRect,

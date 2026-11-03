@@ -152,6 +152,7 @@ enum TermReplacer {
     static func glossaryRisk(for from: String) -> String? {
         let trimmed = from.trimmingCharacters(in: .whitespacesAndNewlines)
         let scalars = Array(trimmed.unicodeScalars)
+        guard !scalars.isEmpty else { return nil }
         if scalars.count <= 2 {
             return "「\(trimmed)」は短すぎるため、他の語の一部を書き換える危険があります"
         }

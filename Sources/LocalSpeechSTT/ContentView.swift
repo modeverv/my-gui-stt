@@ -466,8 +466,11 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
                 )
-                .frame(minWidth: 150, maxWidth: 260)
+                .frame(minWidth: 150, maxWidth: .infinity)
+            }
 
+            // Display options get their own row so that the view-mode tabs and search field never get clipped
+            HStack(spacing: 12) {
                 Spacer()
 
                 Toggle("タイムスタンプ", isOn: $viewModel.showTimestamps)
